@@ -1,47 +1,52 @@
-#include "c_coroutine.h"
-
-#if __APPLE__ && __MACH__
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdint.h>
 #include <sys/ucontext.h>
-#else
-#include <ucontext.h>
-#endif
+#include "coroutine.h"
 
-#define _STACK_SIZE (1024*128) /* 1M bytes */
+#define _STACK_SIZE (1024*128) 
 
 struct coroutine {
-    struct coroutine * next;
-    char stack[_STACK_SIZE];
     ucontext_t ctx;
+    char stack[_STACK_SIZE];
     coroutine_func func;
     void *ud;
     int status;
+    struct coroutine * next;
 };
 
 struct schedule {
-    char stack[_STACK_SIZE];
     ucontext_t main;
+    /*char stack[_STACK_SIZE]; */
     struct coroutine * running;
     struct coroutine * head;
 };
 
-
 static struct coroutine * 
 _co_new(struct schedule *S, coroutine_func func, void *ud) {
-    struct coroutine * co = 0;
-    co = malloc(sizeof(*co));
+    struct coroutine * co = malloc(sizeof(*co));
     if(co) {
         memset(co, 0x00, sizeof(*co));
         co->func = func;
         co->ud = ud;
         co->status = COROUTINE_READY;
     }
-    return co
+    return co;
+}
+
+static void
+_co_delete(struct coroutine *C) {
+    assert(C);
+    free(C);
 }
 
 struct schedule * 
-coroutine_open(void) {
+coroutine_open() {
     struct schedule * S = 0;
-    s = malloc(sizeof(*S));
+    S = malloc(sizeof(*S));
     memset(S, 0x00, sizeof(*S));
     return S;
 }
@@ -54,7 +59,7 @@ coroutine_close(struct schedule * S) {
     while(p) {
         q = p;
         p = p->next;
-        free(q);
+        _co_delete(q);
     }
     free(S);
 }
@@ -65,30 +70,33 @@ coroutine_new(struct schedule *S, coroutine_func func, void *ud) {
     assert(S);
     co = _co_new(S, func, ud);
     if(co) {
-        if(!S->head) {
-            S->head = co;
+        p = S->head;
+        while(p && p->next) {
+            p = p->next;
         }
-        else {
-            p = S->head;
-            while(p->next) {
-                p = p->next;
-            }
+        if(p) {
             p->next = co;
         }
+        else {
+            S->head = co;
+        }
     }
-    return co
+    return co;
 }
 
 static void
 mainfunc(uint32_t low32, uint32_t hi32) {
-    uintptr_t ptr = (uintptr_t)low32 | ((uintptr)hi32 << 32);
+    struct coroutine *p, *q;
+    uintptr_t ptr = (uintptr_t)low32 | ((uintptr_t)hi32 << 32);
     struct schedule *S = (struct schedule *)ptr;
-    struct coroutine_t * C = S->running;
+    struct coroutine *C = S->running;
+
     C->func(S, C->ud);
-    struct schedule *p, *q;
+
     if(S->head == C) {
-        free(S->head);
-        S->head = NULL;
+        q = S->head;
+        S->head = q->next;
+        _co_delete(q);
     }
     else {
         p = S->head;
@@ -98,7 +106,7 @@ mainfunc(uint32_t low32, uint32_t hi32) {
         if(p) {
             q = p->next;
             p->next = q->next;
-            free(q);
+            _co_delete(q);
         }
     }
     S->running = 0;
@@ -107,6 +115,7 @@ mainfunc(uint32_t low32, uint32_t hi32) {
 void
 coroutine_resume(struct schedule *S, struct coroutine * C) {
     struct coroutine *p;
+    uintptr_t ptr = 0;
     int status;
 
     assert(S);
@@ -114,14 +123,11 @@ coroutine_resume(struct schedule *S, struct coroutine * C) {
     assert(!S->running);
 
     p = S->head;
-    while(p) {
-        if(p == C) {
-            break;
-        }
+    while(p && p!=C) {
         p = p->next;
     }
-    assert(p);
     if(!p) {
+        assert(0);
         return;
     }
     
@@ -133,16 +139,16 @@ coroutine_resume(struct schedule *S, struct coroutine * C) {
         C->ctx.uc_stack.ss_size = _STACK_SIZE;
         C->ctx.uc_stack.ss_flags = 0;
         C->ctx.uc_link = &S->main;
+        ptr = (uintptr_t)S;
+        makecontext(&C->ctx, (void (*)(void))mainfunc, 2, (uint32_t)ptr, (uint32_t)(ptr>>32));
         C->status = COROUTINE_RUNNING;
         S->running = C;
-        uintptr_t ptr = (uintptr_t)S;
-        makecontext(&C->ctx, (void (*)(void))mainfunc, 2, (uint32_t)ptr, (uint32_t)(ptr>>32));
         swapcontext(&S->main, &C->ctx);
         break;
     case COROUTINE_SUSPEND:
         C->status = COROUTINE_RUNNING;
         S->running = C;
-        wapcontext(&S->main, &C->ctx);
+        swapcontext(&S->main, &C->ctx);
         break;
     default:
         assert(0);
@@ -151,18 +157,13 @@ coroutine_resume(struct schedule *S, struct coroutine * C) {
 
 void
 coroutine_yield(struct schedule *S) {
-    struct Coroutine * C = 0;
+    struct coroutine * C = 0;
     assert(S);
     assert(S->running);
     C = S->running;
-    if(C->status == COROUTINE_RUNNING) {
-        S->running = NULL;
-        C->status = COROUTINE_SUSPEND;
-        wapcontext(&C->ctx, &S->main);
-    }
-    else {
-        assert(0);
-    }
+    S->running = NULL;
+    C->status = COROUTINE_SUSPEND;
+    swapcontext(&C->ctx, &S->main);
 }
 
 struct coroutine *
